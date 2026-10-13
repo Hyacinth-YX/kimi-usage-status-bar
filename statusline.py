@@ -3,12 +3,14 @@
 5h / 7d quota bars at the end.
 
 - Normal mode (stdin = JSON snapshot from the TUI): prints one status line.
-  Quota and git status are read from local caches; stale entries trigger a
-  background refresh so the 300ms script budget is never blown.
-- --refresh [--cwd PATH]: updates the caches. Quota comes from
+  Quota is read from a local cache; a stale entry triggers a background
+  refresh so the 300ms script budget is never blown.
+- --refresh: updates the quota cache from
   https://api.kimi.com/coding/v1/usages with the OAuth token from
-  ~/.kimi-code/credentials/kimi-code.json; git status is collected with the
-  exact same git commands the TUI uses for its built-in badge.
+  ~/.kimi-code/credentials/kimi-code.json.
+
+The git slot shows only the branch name from the TUI's stdin snapshot; this
+script never shells out to git.
 
 Colors replicate the built-in footer: the TUI wraps the custom line in its
 `text` color but inner ANSI escapes pass through, so we emit palette colors
@@ -21,7 +23,6 @@ cannot be replicated and are omitted.
 
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -32,16 +33,13 @@ from datetime import datetime
 KIMI_HOME = os.environ.get("KIMI_CODE_HOME", os.path.expanduser("~/.kimi-code"))
 CRED_FILE = os.path.join(KIMI_HOME, "credentials", "kimi-code.json")
 CACHE_FILE = os.path.join(KIMI_HOME, "cache", "statusline-quota.json")
-GIT_CACHE_FILE = os.path.join(KIMI_HOME, "cache", "statusline-git.json")
 DEBUG_STDIN = os.path.join(KIMI_HOME, "cache", "statusline-stdin.json")
 TUI_FILE = os.path.join(KIMI_HOME, "tui.toml")
 USAGES_URL = "https://api.kimi.com/coding/v1/usages"
 
 CACHE_TTL = 180        # seconds before a quota background refresh is triggered
 ERR_CACHE_TTL = 60     # shorter TTL after a failed quota fetch
-GIT_TTL = 15           # seconds before git status is refreshed (TUI uses 15s)
 FETCH_TIMEOUT = 8      # network timeout, only used by the background refresher
-GIT_TIMEOUT = 0.5      # per git command, same as the TUI's 500ms
 BAR_WIDTH = 10
 BAR_GLYPH = "▬"        # vertically centered rectangle; "▄" hugs the baseline, "■" is square
 
@@ -184,112 +182,6 @@ def quota_segment(pal, cache):
     return "  ".join(segs)
 
 
-# ------------------------------------------------------------------ git ----
-
-AHEAD_BEHIND_RE = re.compile(r"\[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\]")
-
-
-def run_git(cwd, args):
-    r = subprocess.run(
-        ["git", "-C", cwd] + args,
-        capture_output=True, timeout=GIT_TIMEOUT,
-    )
-    if r.returncode != 0:
-        return None
-    return r.stdout.decode("utf-8", "replace")
-
-
-def collect_git(cwd):
-    """Same commands as the TUI's built-in git badge."""
-    try:
-        branch = run_git(cwd, ["branch", "--show-current"])
-        if branch is None:
-            return None
-        branch = branch.strip()
-        if not branch:
-            return None
-        dirty = False
-        ahead = behind = added = deleted = 0
-        out = run_git(cwd, ["status", "--porcelain"])
-        if out is not None:
-            for line in out.split("\n"):
-                if line.startswith("## "):
-                    m = AHEAD_BEHIND_RE.search(line)
-                    if m:
-                        ahead = int(m.group(1) or 0)
-                        behind = int(m.group(2) or 0)
-                elif line.strip():
-                    dirty = True
-        if dirty:
-            out = run_git(cwd, ["diff", "--numstat", "HEAD"])
-            if out:
-                for line in out.split("\n"):
-                    parts = line.split("\t")
-                    if len(parts) >= 2:
-                        if parts[0].isdigit():
-                            added += int(parts[0])
-                        if parts[1].isdigit():
-                            deleted += int(parts[1])
-        return {"branch": branch, "dirty": dirty, "ahead": ahead,
-                "behind": behind, "added": added, "deleted": deleted,
-                "fetched_at": time.time()}
-    except Exception:
-        return None
-
-
-def read_git_cache():
-    try:
-        with open(GIT_CACHE_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def refresh_git(cwd):
-    st = collect_git(cwd)
-    cache = read_git_cache()
-    if st is None:
-        st = {"branch": None, "fetched_at": time.time()}
-    cache[cwd] = st
-    # prune entries not touched for a day
-    cutoff = time.time() - 86400
-    cache = {k: v for k, v in cache.items()
-             if v.get("fetched_at", 0) > cutoff}
-    os.makedirs(os.path.dirname(GIT_CACHE_FILE), exist_ok=True)
-    tmp = GIT_CACHE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(cache, f)
-    os.replace(tmp, GIT_CACHE_FILE)
-
-
-def git_fresh(entry):
-    return bool(entry) and time.time() - entry.get("fetched_at", 0) <= GIT_TTL
-
-
-def git_badge(st, pal):
-    """Replicates the TUI's formatGitBadgeBase: branch [+A -D ↑N ↓M], ± when dirty."""
-    parts = []
-    diff = []
-    if st.get("added", 0) > 0:
-        diff.append(f"+{st['added']}")
-    if st.get("deleted", 0) > 0:
-        diff.append(f"-{st['deleted']}")
-    if diff:
-        parts.append(" ".join(diff))
-    elif st.get("dirty"):
-        parts.append("±")
-    sync = ""
-    if st.get("ahead", 0) > 0:
-        sync += f"↑{st['ahead']}"
-    if st.get("behind", 0) > 0:
-        sync += f"↓{st['behind']}"
-    if sync:
-        parts.append(sync)
-    branch = st["branch"]
-    text = branch if not parts else f"{branch} [{' '.join(parts)}]"
-    return paint(text, pal["textDim"])
-
-
 # ----------------------------------------------------------------- main ----
 
 MODE_LABELS = {
@@ -313,12 +205,10 @@ def shorten_cwd(cwd):
     return "…/" + "/".join(segs[-3:])
 
 
-def spawn_refresh(cwd):
-    args = [sys.executable, os.path.abspath(__file__), "--refresh"]
-    if cwd:
-        args += ["--cwd", cwd]
+def spawn_refresh():
     subprocess.Popen(
-        args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        [sys.executable, os.path.abspath(__file__), "--refresh"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, start_new_session=True,
     )
 
@@ -335,11 +225,10 @@ def main():
     pal = current_palette()
     cwd = snap.get("cwd")
     quota_cache = read_quota_cache()
-    git_entry = read_git_cache().get(str(cwd)) if cwd else None
 
-    if not quota_fresh(quota_cache) or (cwd and not git_fresh(git_entry)):
-        # fire-and-forget background refresh; display current caches this round
-        spawn_refresh(str(cwd) if cwd else None)
+    if not quota_fresh(quota_cache):
+        # fire-and-forget background refresh; display current cache this round
+        spawn_refresh()
 
     parts = []
 
@@ -358,10 +247,8 @@ def main():
     if cwd:
         parts.append(paint(shorten_cwd(str(cwd)), pal["textDim"]))
 
-    # git slot: cached full status (branch + diff stats), like the TUI badge
-    if git_entry and git_entry.get("branch"):
-        parts.append(git_badge(git_entry, pal))
-    elif snap.get("gitBranch"):
+    # git slot: branch name from the TUI snapshot (no git subprocess)
+    if snap.get("gitBranch"):
         parts.append(paint(str(snap["gitBranch"]), pal["textDim"]))
 
     # quota bars, appended at the end
@@ -375,7 +262,5 @@ if __name__ == "__main__":
         quota_cache = read_quota_cache()
         if not quota_fresh(quota_cache):
             refresh_quota()
-        if "--cwd" in sys.argv:
-            refresh_git(sys.argv[sys.argv.index("--cwd") + 1])
     else:
         main()
